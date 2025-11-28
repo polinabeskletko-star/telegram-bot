@@ -2,7 +2,6 @@ import os
 from datetime import datetime, timedelta
 
 import pytz
-from openai import OpenAI
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -11,48 +10,45 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from openai import OpenAI
 
-# ================== SETTINGS / ENV VARS ==================
+# ==== SETTINGS ====
 
-# Telegram bot token
+# Bot token from environment
 TOKEN = os.environ.get("BOT_TOKEN")
 
 # Group chat ID where hourly question will be sent (e.g. "-1001234567890")
 GROUP_CHAT_ID = os.environ.get("GROUP_CHAT_ID")
 
-# Timezone (default: Brisbane)
+# Timezone for scheduling. By default: Brisbane. You can override with BOT_TZ env var.
 TIMEZONE = os.environ.get("BOT_TZ", "Australia/Brisbane")
 
-# Target user and chat for sarcastic replies (Максим)
-TARGET_USER_ID_ENV = os.environ.get("TARGET_USER_ID")   # numeric string
-TARGET_CHAT_ID = os.environ.get("TARGET_CHAT_ID")       # string chat id
-TARGET_USER_ID = int(TARGET_USER_ID_ENV) if TARGET_USER_ID_ENV else None
-
-# Second user: пишет про Максима, бот усиливает поддержку Максима
-SUPPORT_USER_ID_ENV = os.environ.get("SUPPORT_USER_ID")
-SUPPORT_USER_ID = (
-    int(SUPPORT_USER_ID_ENV)
-    if SUPPORT_USER_ID_ENV
-    else 502791142  # дефолт
-)
-
 # OpenAI
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-client = OpenAI()  # API key берётся из OPENAI_API_KEY
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Максим (саркастичные ответы)
+TARGET_USER_ID = int(os.environ.get("TARGET_USER_ID", "0"))
+
+# Второй пользователь (поддержка Максима)
+SUPPORT_USER_ID = int(os.environ.get("SUPPORT_USER_ID", "0"))
+
+# Твой личный чат для уведомлений о запуске
+OWNER_CHAT_ID = os.environ.get("OWNER_CHAT_ID")
 
 
-# ================== HELPERS ==================
+# ---------- HELPERS ----------
 
 def get_tz() -> pytz.BaseTzInfo:
     """Return timezone object from TIMEZONE setting."""
     return pytz.timezone(TIMEZONE)
 
 
-def compute_next_quarter_hour(dt: datetime) -> datetime:
+def compute_next_quarter(dt: datetime) -> datetime:
     """
     Return the next time at HH:15 after the given datetime `dt`.
-    `dt` must be timezone-aware.
     Example: 09:02 -> 09:15, 09:20 -> 10:15, etc.
+    `dt` must be timezone-aware.
     """
     next_run = dt.replace(minute=15, second=0, microsecond=0)
     if dt >= next_run:
@@ -62,115 +58,73 @@ def compute_next_quarter_hour(dt: datetime) -> datetime:
 
 def is_night_time(dt: datetime) -> bool:
     """
-    Night time = 22:00–09:00 (inclusive 22:00, exclusive 09:00).
-    During this time the bot will NOT send the hourly question.
+    Define night time as 22:00–09:00 (inclusive of 22:00, exclusive of 09:00).
+    During this time the bot will NOT send the question.
     """
     hour = dt.hour
+    # Night if time is 22:00–23:59 or 00:00–08:59
     return hour >= 22 or hour < 9
 
 
-def describe_part_of_day_ru(dt: datetime) -> str:
-    """Return Russian description of time of day."""
-    hour = dt.hour
-    if 9 <= hour < 12:
-        return "утро"
-    elif 12 <= hour < 18:
-        return "день"
-    elif 18 <= hour < 22:
-        return "вечер"
-    else:
-        return "ночь"
-
-
-def build_hourly_prompt(now: datetime) -> str:
-    """Prompt для генерации ежечасного вопроса к Максиму."""
-    weekday_names = [
-        "понедельник",
-        "вторник",
-        "среда",
-        "четверг",
-        "пятница",
-        "суббота",
-        "воскресенье",
-    ]
-    weekday = weekday_names[now.weekday()]
-    part_of_day = describe_part_of_day_ru(now)
-
-    return (
-        "Сгенерируй ОДИН короткий вопрос по-русски для телеграм-чата, "
-        "обращаясь к Максиму по имени. "
-        "Смысл: узнать, как у него дела и чем он сейчас занимается. "
-        "Стиль: дружелюбный, чуть-чуть шутливый, но без грубостей. "
-        "Не пиши смайлики и не используй хэштеги. "
-        "Это должно быть самостоятельное сообщение в чат, а не ответ на чью-то реплику. "
-        "Упомяни в формулировке, что сейчас " + part_of_day +
-        " и " + weekday + ". "
-        "Максимум 20 слов. Только текст вопроса, без пояснений."
+async def generate_sarcastic_reply(user_text: str) -> str:
+    """Саркастичный ответ для Максима через OpenAI, с fallback, если API не сработал."""
+    prompt = (
+        "Ты дружелюбный, но слегка саркастичный друг по имени Друг Максима. "
+        "Ты отвечаешь по-русски. Тон добрый, без оскорблений, но с лёгкой иронией. "
+        "Отвечай коротко (1–2 предложения). "
+        f"Сообщение Максима: «{user_text}»"
     )
 
-
-def build_sarcastic_prompt(user_text: str) -> str:
-    """Prompt для саркастического сообщения про Максима."""
-    return (
-        "Ты язвительный, но доброжелательный друг в телеграм-чате. "
-        "В чате есть Максим, к которому ты обращаешься на 'ты' по имени. "
-        "Сделай одно короткое шутливое сообщение по-русски, как будто ты комментируешь поведение или слова Максима. "
-        "Стиль: лёгкий сарказм, без оскорблений, без мата, максимум 25 слов. "
-        "Это должно быть самостоятельное сообщение в чат, а не ответ на чью-то реплику, не упоминай, что кто-то что-то писал. "
-        "Не используй смайлики и хэштеги. "
-        "Текст, который писал Максим:\n\n"
-        f"{user_text}\n\n"
-        "Теперь придумай одно подходящее саркастическое сообщение в чат, обращаясь к Максиму. "
-        "Только текст сообщения, без пояснений."
-    )
-
-
-def build_supportive_prompt(user_text: str) -> str:
-    """
-    Prompt для поддерживающего сообщения для Максима
-    на основе реплики второго пользователя.
-    Сообщение должно быть коротким и без чрезмерной лести.
-    """
-    return (
-        "Ты спокойный, поддерживающий друг в телеграм-чате. "
-        "В чате есть Максим, к которому ты обращаешься на 'ты' по имени. "
-        "Ниже дано сообщение другого пользователя, который описывает, что Максим делает, чувствует или как он себя ведёт. "
-        "Твоя задача — написать одно короткое, простое сообщение по-русски, которое поддерживает Максима: "
-        "покажи, что ты видишь его усилия и веришь, что он справится. "
-        "Стиль: естественный разговорный, без пафоса и без чрезмерных комплиментов. "
-        "Не используй слова вроде «невероятно», «великолепный», «вдохновляешь всех вокруг» и подобные громкие фразы. "
-        "Обращайся к Максиму напрямую. "
-        "Это должно быть самостоятельное сообщение в чат, а не прямой ответ на чью-то реплику. "
-        "Не упоминай других людей и не говори, что отвечаешь на чьё-то сообщение. "
-        "Максимум 15 слов. Не используй смайлики и хэштеги. "
-        "Сообщение другого пользователя (про Максима):\n\n"
-        f"{user_text}\n\n"
-        "Теперь придумай одно короткое поддерживающее сообщение, обращаясь к Максиму. "
-        "Только текст сообщения, без пояснений."
-    )
-
-
-def generate_ai_text(prompt: str, fallback: str) -> str:
-    """
-    Вспомогательная функция: вызвать OpenAI Responses API и вернуть текст.
-    В случае ошибки вернёт fallback и напечатает ошибку в логи.
-    """
     try:
-        resp = client.responses.create(
-            model=OPENAI_MODEL,
-            input=prompt,
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "Ты дружелюбный и немного саркастичный друг Максима."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=80,
+            temperature=0.8,
         )
-        if resp.output and resp.output[0].content:
-            text = resp.output[0].content[0].text.strip()
-            if text:
-                return text
+        text = response.choices[0].message.content.strip()
+        return text
     except Exception as e:
-        print("Error calling OpenAI, using fallback text:", e)
+        print("Error calling OpenAI, using fallback joke:", e)
+        return "Максим, я даже не знаю, что сказать… Ты сам понял, что написал? 😏"
 
-    return fallback
+
+async def generate_support_reply_for_maxim(original_text: str) -> str:
+    """
+    Короткая, тёплая поддержка Максима, основанная на сообщении другого человека.
+    Ответ должен выглядеть как самостоятельное утверждение, а не прямой ответ.
+    """
+    prompt = (
+        "Ты чат-бот 'Друг Максима'. Ты видишь сообщение от друга Максима, "
+        "который пытается его поддержать. На основе этого сообщения придумай "
+        "очень короткую (1–2 предложения) поддержку именно для Максима. "
+        "Не обращайся к автору сообщения, обращайся только к Максиму. "
+        "Не будь чрезмерно пафосным и приторным, просто добрые, спокойные слова. "
+        "Пиши по-русски.\n\n"
+        f"Сообщение друга: «{original_text}»"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": "Ты добрый друг Максима и поддерживаешь его."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=80,
+            temperature=0.7,
+        )
+        text = response.choices[0].message.content.strip()
+        return text
+    except Exception as e:
+        print("Error calling OpenAI for support reply, using fallback:", e)
+        return "Максим, рядом есть люди, которые в тебя верят. И я в том числе."
 
 
-# ================== COMMAND HANDLERS ==================
+# ---------- COMMAND HANDLERS ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
@@ -178,21 +132,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_type == "private":
         await update.message.reply_text(
             "Привет! Я Друг Максима 🤖\n"
-            "В группе я каждый час в :15 спрашиваю, как у Максима дела, формулировки зависят от времени суток.\n"
-            "Ночью с 22:00 до 9:00 я молчу 😴\n"
-            "В чате я шучу над Максимом и поддерживаю его, "
-            "когда другой пользователь пишет про него что-то хорошее."
+            "В группе я каждый час в 15 минут буду спрашивать:\n"
+            "«Максим, как у тебя дела? Чем занимаешься?»\n"
+            "Ночью с 22:00 до 9:00 я молчу 😴"
         )
     else:
         await update.message.reply_text(
-            "Я отправляю вопрос Максиму каждый час в :15, кроме ночи с 22:00 до 9:00. "
-            "Саркастически комментирую сообщения Максима и поддерживаю его, "
-            "когда второй выбранный пользователь пишет про него."
+            "Я отправляю вопрос Максиму каждый час в 15 минут, "
+            "кроме ночи с 22:00 до 9:00."
         )
 
 
 async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send back the current chat ID (useful to configure GROUP_CHAT_ID / TARGET_CHAT_ID)."""
+    """Send back the current chat ID (useful to configure GROUP_CHAT_ID)."""
     cid = update.effective_chat.id
     await update.message.reply_text(
         f"Chat ID for this chat: `{cid}`",
@@ -201,17 +153,18 @@ async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return user id for testing TARGET_USER_ID / SUPPORT_USER_ID."""
+    """Return user id for debugging / env configuration."""
     user = update.effective_user
-    if not user:
-        return
-    await update.message.reply_text(f"Your user id: `{user.id}`", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Ваш user_id: `{user.id}`",
+        parse_mode="Markdown",
+    )
 
 
 async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Simple echo reply ONLY in private chats.
-    In groups the bot stays quiet (except scheduled messages + target jokes/support).
+    In groups the bot stays quiet (except scheduled messages and special replies).
     """
     if update.effective_chat.type != "private":
         return
@@ -220,14 +173,13 @@ async def echo_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Ты написал: {text}")
 
 
-# ================== GROUP MESSAGE HANDLER (JOKES & SUPPORT) ==================
+# ---------- MESSAGE HANDLER FOR GROUP ----------
 
-async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def group_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатываем сообщения в группах.
-    - TARGET_USER_ID (Максим): язвительное, но доброе сообщение про него.
-    - SUPPORT_USER_ID: поддерживающее сообщение для Максима на основе текста второго пользователя.
-    Все ответы — отдельные сообщения в чат, НЕ reply.
+    Обрабатываем сообщения в группе:
+    - если пишет Максим (TARGET_USER_ID) -> саркастичный ответ;
+    - если пишет SUPPORT_USER_ID -> короткая поддержка Максима.
     """
     message = update.message
     if not message:
@@ -235,75 +187,48 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     chat = update.effective_chat
     user = update.effective_user
+
+    chat_id = chat.id
+    user_id = user.id
+    user_name = user.username or user.full_name
     text = message.text or ""
 
-    chat_id_str = str(chat.id)
-    user_id = user.id if user else None
-    user_name = user.username if user and user.username else (user.full_name if user else "Unknown")
-
     print(
-        f"DEBUG UPDATE: chat_id={chat.id} chat_type={chat.type} "
-        f"user_id={user_id} user_name={user_name} text='{text}'"
+        f"DEBUG UPDATE: chat_id={chat_id} chat_type={chat.type} "
+        f"user_id={user_id} user_name={user_name} text={text!r}"
     )
 
-    # Ограничиваемся целевым чатом (если задан)
-    if TARGET_CHAT_ID and chat_id_str != TARGET_CHAT_ID:
+    # Только в группе, не в личке
+    if chat.type not in ("group", "supergroup"):
         return
 
-    if user_id is None:
+    # Максим — сарказм
+    if TARGET_USER_ID and user_id == TARGET_USER_ID:
+        print(f"TARGET MESSAGE (Maxim): from user {user_id} in chat {chat_id}: {text!r}")
+        reply_text = await generate_sarcastic_reply(text)
+        await message.reply_text(reply_text)
+        print("Sarcastic reply sent.")
         return
 
-    # ----- Ветка 1: сарказм для Максима (TARGET_USER_ID) -----
-    if TARGET_USER_ID is not None and user_id == TARGET_USER_ID:
-        print(
-            f"TARGET (sarcastic) MESSAGE: from user {user_id} in chat {chat.id}: '{text}'"
-        )
-
-        prompt = build_sarcastic_prompt(text)
-        fallback = "Максим, ты как всегда на высоте… по уровню хаоса в своём расписании."
-        reply_text = generate_ai_text(prompt, fallback)
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=reply_text
-            )
-            print("Sarcastic standalone message sent.")
-        except Exception as e:
-            print("Error sending sarcastic message:", e)
+    # Друг, поддерживающий Максима
+    if SUPPORT_USER_ID and user_id == SUPPORT_USER_ID:
+        print(f"SUPPORT MESSAGE: from user {user_id} in chat {chat_id}: {text!r}")
+        reply_text = await generate_support_reply_for_maxim(text)
+        # ВАЖНО: ответ не как reply, чтобы выглядел самостоятельным
+        await context.bot.send_message(chat_id=chat_id, text=reply_text)
+        print("Support reply for Maxim sent.")
         return
 
-    # ----- Ветка 2: поддержка для Максима на основе второго пользователя -----
-    if SUPPORT_USER_ID is not None and user_id == SUPPORT_USER_ID:
-        print(
-            f"SUPPORT (for Maxim) MESSAGE: from user {user_id} in chat {chat.id}: '{text}'"
-        )
-
-        prompt = build_supportive_prompt(text)
-        fallback = "Максим, видно, что ты стараешься. Всё получится, просто продолжай двигаться вперёд."
-        reply_text = generate_ai_text(prompt, fallback)
-
-        try:
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=reply_text
-            )
-            print("Supportive standalone message sent.")
-        except Exception as e:
-            print("Error sending supportive message:", e)
-        return
-
-    # Остальные пользователи — игнор
+    # Остальных игнорируем (бот молчит)
     return
 
 
-# ================== SCHEDULED HOURLY MESSAGE ==================
+# ---------- SCHEDULED HOURLY MESSAGE ----------
 
 async def hourly_message(context: ContextTypes.DEFAULT_TYPE):
     """
-    Ежечасное сообщение в GROUP_CHAT_ID в HH:15,
-    но только если не ночь (22:00–09:00).
-    Текст формируется через OpenAI, чтобы фразы отличались и учитывали время суток.
+    Send the hourly message to GROUP_CHAT_ID at HH:15,
+    but only if it's not night time (22:00–09:00).
     """
     chat_id = GROUP_CHAT_ID
     if not chat_id:
@@ -314,39 +239,56 @@ async def hourly_message(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(tz)
 
     if is_night_time(now):
-        print(f"{now} – night time, hourly message not sent.")
+        print(f"{now} – night time, message not sent.")
         return
-
-    prompt = build_hourly_prompt(now)
-    fallback = "Максим, как у тебя дела? Чем занимаешься сейчас?"
-
-    text = generate_ai_text(prompt, fallback)
 
     try:
         chat_id_int = int(chat_id)
         await context.bot.send_message(
             chat_id=chat_id_int,
-            text=text
+            text="Максим, как у тебя дела? Чем занимаешься?"
         )
-        print(f"{now} – hourly AI message sent to chat {chat_id_int}: {text}")
+        print(f"{now} – message sent to chat {chat_id_int}")
     except Exception as e:
         print("Error sending hourly message:", e)
 
 
-# ================== MAIN APP ==================
+# ---------- STARTUP NOTIFICATION ----------
+
+async def on_startup(app: Application):
+    """
+    Отправляет тебе в личный Telegram сообщение, что бот запустился.
+    Вызывается один раз после инициализации приложения.
+    """
+    if not OWNER_CHAT_ID:
+        print("OWNER_CHAT_ID is not set; startup notification skipped.")
+        return
+
+    try:
+        owner_id = int(OWNER_CHAT_ID)
+        tz = get_tz()
+        now = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+        text = f"🤖 Бот «Друг Максима» перезапущен и работает (время сервера: {now} {TIMEZONE})."
+        await app.bot.send_message(chat_id=owner_id, text=text)
+        print(f"Startup notification sent to OWNER_CHAT_ID={owner_id}")
+    except Exception as e:
+        print("Failed to send startup notification:", e)
+
+
+# ---------- MAIN APP ----------
 
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in environment variables!")
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(on_startup).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("chatid", chat_id))
     app.add_handler(CommandHandler("whoami", whoami))
 
-    # Private echo
+    # Echo ONLY in private chats (no duplication in group)
     app.add_handler(
         MessageHandler(
             filters.TEXT & filters.ChatType.PRIVATE & ~filters.COMMAND,
@@ -354,19 +296,19 @@ def main():
         )
     )
 
-    # Group messages (for sarcastic + supportive replies)
+    # Group handler (Maxim + support user)
     app.add_handler(
         MessageHandler(
-            filters.TEXT & filters.ChatType.GROUPS & ~filters.COMMAND,
-            handle_group_message,
+            filters.TEXT & (filters.ChatType.GROUPS),
+            group_message_handler,
         )
     )
 
-    # JobQueue scheduling (HH:15 every hour)
+    # JobQueue scheduling
     job_queue = app.job_queue
     tz = get_tz()
     now = datetime.now(tz)
-    first_run = compute_next_quarter_hour(now)
+    first_run = compute_next_quarter(now)
 
     print(
         f"Local time now: {now} [{TIMEZONE}]. "
@@ -374,18 +316,14 @@ def main():
         f"(HH:15 each hour, skipping 22:00–09:00)."
     )
 
+    # First run at next HH:15, then every 3600 seconds (1 hour)
     job_queue.run_repeating(
         hourly_message,
-        interval=3600,   # every hour
+        interval=3600,
         first=first_run,
     )
 
-    print(
-        "Bot started and hourly AI job scheduled...\n"
-        f"TARGET_USER_ID (sarcasm): {TARGET_USER_ID}, "
-        f"SUPPORT_USER_ID (support for Maxim): {SUPPORT_USER_ID}, "
-        f"TARGET_CHAT_ID: {TARGET_CHAT_ID}"
-    )
+    print("Bot started and hourly job scheduled...")
     app.run_polling()
 
 

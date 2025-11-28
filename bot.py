@@ -151,7 +151,7 @@ def main():
     print(
         f"Local time now: {now} [{TIMEZONE}]. "
         f"First hourly_message scheduled at: {first_run} "
-        f"(HH:40 each hour, skipping 22:00–09:00)."
+        f"(HH:50 each hour, skipping 22:00–09:00)."
     )
 
     # First run at next HH:30, then every 3600 seconds (1 hour)

@@ -1,7 +1,8 @@
 import os
 import random
 import asyncio
-from datetime import datetime, time, date
+from collections import defaultdict
+from datetime import datetime, time
 
 import pytz
 import httpx
@@ -37,7 +38,7 @@ if OPENAI_API_KEY:
     client = OpenAI(api_key=OPENAI_API_KEY)
 
 # Память сообщений за день для вечернего обзора
-DAILY_MESSAGES: list[dict] = []
+DAILY_MESSAGES: defaultdict[str, list[str]] = defaultdict(list)
 
 
 # ---------- HELPERS ----------
@@ -62,47 +63,12 @@ async def log_to_admin(context: ContextTypes.DEFAULT_TYPE, message: str):
             print("Failed to send admin log:", e)
 
 
-async def get_weather_brief(now: datetime) -> str | None:
-    """
-    Получаем краткое описание погоды для Brisbane через Open-Meteo.
-    Без ключа, если не получится — возвращаем None.
-    """
-    # Координаты Брисбена
-    latitude = -27.47
-    longitude = 153.03
-    url = "https://api.open-meteo.com/v1/forecast"
-
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "current_weather": "true",
-        "timezone": "auto",
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client_http:
-            resp = await client_http.get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except Exception as e:
-        print("Weather API error:", e)
-        return None
-
-    try:
-        cw = data["current_weather"]
-        temp = cw["temperature"]
-        wind = cw.get("windspeed")
-        # Можно чуть подсластить текст
-        if wind is not None:
-            return f"Сейчас примерно {temp}°C, ветер около {wind} км/ч."
-        return f"Сейчас примерно {temp}°C."
-    except Exception as e:
-        print("Weather parse error:", e)
-        return None
-
-
-async def call_openai(system_prompt: str, user_prompt: str,
-                      max_tokens: int = 120, temperature: float = 0.7) -> tuple[str | None, str | None]:
+async def call_openai(
+    system_prompt: str,
+    user_prompt: str,
+    max_tokens: int = 120,
+    temperature: float = 0.7,
+) -> tuple[str | None, str | None]:
     """
     Обёртка над OpenAI. Возвращает (text, error_message).
     """
@@ -128,12 +94,66 @@ async def call_openai(system_prompt: str, user_prompt: str,
         return None, err
 
 
+async def fetch_weather_summary() -> str | None:
+    """
+    Берём текущую погоду по координатам Брисбена через Open-Meteo.
+    Без ключа, только httpx.
+    """
+    # Координаты Брисбена
+    latitude = -27.47
+    longitude = 153.03
+
+    url = "https://api.open-meteo.com/v1/forecast"
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current_weather": "true",
+        "timezone": TIMEZONE,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client_http:
+            resp = await client_http.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        cw = data.get("current_weather") or {}
+        temp = cw.get("temperature")
+        code = cw.get("weathercode")
+
+        if temp is None or code is None:
+            return None
+
+        # Очень грубая расшифровка кода
+        if code == 0:
+            desc = "ясно"
+        elif code in (1, 2, 3):
+            desc = "облачно"
+        elif code in (45, 48):
+            desc = "туман"
+        elif 51 <= code <= 67:
+            desc = "морось или дождь"
+        elif 71 <= code <= 77:
+            desc = "снег (если вдруг такое случится)"
+        elif 80 <= code <= 82:
+            desc = "дождевые ливни"
+        elif 95 <= code <= 99:
+            desc = "гроза, самое время задуматься о смысле жизни"
+        else:
+            desc = "какая-то странная погода, но жить можно"
+
+        return f"В Брисбене сейчас около {temp}°C, {desc}."
+    except Exception as e:
+        print("Weather fetch error:", e)
+        return None
+
+
 async def generate_message_for_kind(
     kind: str,
     now: datetime,
     user_text: str | None = None,
-    weather_brief: str | None = None,
-    day_log_text: str | None = None,
+    weather_text: str | None = None,
+    day_messages: list[str] | None = None,
 ) -> tuple[str | None, str | None]:
     """
     kind:
@@ -141,43 +161,44 @@ async def generate_message_for_kind(
       - "support_for_maxim" — поддержка от имени бота на сообщения Сергея
       - "weekend_hourly"    — часовой вопрос по выходным
       - "weekday_morning"   — утреннее сообщение по будням (с погодой)
-      - "day_summary"       — вечерний обзор дня
+      - "daily_summary"     — вечерний саркастический обзор дня
     """
     weekday = now.weekday()  # 0=Mon ... 6=Sun
     weekday_names = ["понедельник", "вторник", "среда", "четверг",
                      "пятница", "суббота", "воскресенье"]
     weekday_name = weekday_names[weekday]
     time_str = now.strftime("%H:%M")
+    date_str = now.strftime("%Y-%m-%d")
 
     if kind == "sarcastic_reply":
         system_prompt = (
-            "Ты дружелюбный, но максимально саркастичный бот-друг по имени 'Друг Максима'. "
-            "Пишешь по-русски, на 'ты', коротко (1–2 предложения). "
-            "Мягко стебёшь Максима, но без оскорблений и токсичности. "
-            "Не повторяешь его текст, не используешь эмодзи в каждом сообщении (максимум один, и не всегда)."
+            "Ты дружелюбный, но довольно саркастичный бот-друг по имени 'Друг Максима'. "
+            "Ты пишешь по-русски, на 'ты', коротко (1–2 предложения). "
+            "Мягко подкалывай Максима, но без грубости и откровенной токсичности. "
+            "Не используй эмодзи в каждом сообщении, максимум один, и не всегда."
         )
         user_prompt = (
             f"Сегодня {weekday_name}, время {time_str}. "
             f"Максим написал в чат: «{user_text}».\n"
-            "Ответь коротко, с явной иронией. "
-            "Сообщение должно быть самостоятельным, а не выглядеть как ответ цитатой."
+            "Ответь коротко, с лёгкой иронией. Не повторяй дословно текст Максима. "
+            "Сообщение должно быть самостоятельным, а не выглядеть как явный ответ."
         )
-        return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.8)
+        return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.9)
 
     if kind == "support_for_maxim":
         system_prompt = (
             "Ты бот-поддержка Максима. Ты видишь сообщения от другого человека, "
             "который его подбадривает. Твоя задача — добавить ещё одну короткую, "
-            "искреннюю поддержку для Максима. Пиши по-русски, на 'ты'. "
-            "1 короткое предложение, максимум два. "
-            "Не будь слишком льстивым, избегай громких слов типа 'величайший', 'гениальный' и т.п. "
+            "искреннюю, но не приторную поддержку для Максима. Пиши по-русски, на 'ты'. "
+            "1 короткое предложение, максимум два. Не будь слишком льстивым, "
+            "избегай громких слов типа 'невероятный', 'величайший' и т.п. "
             "Сообщение должно быть самостоятельным высказыванием, не ответом этому человеку. "
-            "Обязательно упоминай Максима по имени хотя бы один раз. Никакого сарказма здесь."
+            "Обязательно упоминай Максима по имени хотя бы один раз."
         )
         user_prompt = (
             f"Сегодня {weekday_name}, время {time_str}. "
             f"Другой человек написал в чат слова поддержки Максиму: «{user_text}».\n"
-            "Сформулируй от себя ещё одну естественную поддержку для Максима."
+            "Сформулируй от себя ещё одну естественную, живую поддержку для Максима."
         )
         return await call_openai(system_prompt, user_prompt, max_tokens=60, temperature=0.7)
 
@@ -185,86 +206,57 @@ async def generate_message_for_kind(
         system_prompt = (
             "Ты бот-друг Максима в Telegram-чате. "
             "По выходным ты примерно раз в час задаёшь Максиму вопрос, как у него дела "
-            "и чем он занят. Пишешь по-русски, на 'ты'. "
-            "Коротко: 1–2 предложения. Тон дружелюбный, с заметным сарказмом, но без злобы. "
+            "и чем он занят. Пиши по-русски, на 'ты'. "
+            "Коротко: 1–2 предложения. Можно иногда язвительно, но по-доброму. "
             "Не повторяй каждый раз одну и ту же формулировку. "
-            "Эмодзи можно использовать, но не обязательно и не больше одного."
+            "Не злоупотребляй эмодзи — максимум один, и не в каждом сообщении."
         )
         user_prompt = (
             f"Сейчас {weekday_name}, {time_str}. "
             "Придумай очередной вопрос или небольшое обращение к Максиму, "
-            "которое звучит как самостоятельная реплика и заставляет его слегка улыбнуться."
+            "которое поможет ему почувствовать внимание и немного улыбнуться."
         )
-        return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.8)
+        return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.9)
 
     if kind == "weekday_morning":
         system_prompt = (
             "Ты бот-друг Максима в рабочем чате. "
             "По будням в 7 утра ты желаешь Максиму доброго утра и хорошего рабочего дня. "
-            "Пишешь по-русски, на 'ты', 1–2 предложения. "
-            "Тон лёгкий, слегка саркастичный, но доброжелательный. "
+            "Пиши по-русски, на 'ты', 1–2 предложения. "
+            "Тон лёгкий, доброжелательный, можно с лёгким юмором и лёгким сарказмом. "
             "Упоминай, что впереди рабочий день. Эмодзи можно, но не обязательно."
         )
-        weather_part = weather_brief or "Про погоду промолчу, сервис молчит."
+        weather_part = weather_text or "Про погоду тебе ничего не известно."
         user_prompt = (
-            f"Сегодня {weekday_name}, время {time_str}. {weather_part}\n"
+            f"Сегодня {weekday_name}, дата {date_str}, время {time_str}. "
+            f"Информация о погоде: {weather_part} "
             "Сделай короткое утреннее сообщение для Максима: поздоровайся, "
-            "пожелай хорошего рабочего дня и с лёгкой иронией намекни, "
-            "что ты будешь за ним наблюдать в чате."
+            "пожелай хорошего рабочего дня и намекни, что ты будешь за ним наблюдать в чате."
         )
-        return await call_openai(system_prompt, user_prompt, max_tokens=90, temperature=0.7)
+        return await call_openai(system_prompt, user_prompt, max_tokens=80, temperature=0.8)
 
-    if kind == "day_summary":
+    if kind == "daily_summary":
         system_prompt = (
-            "Ты максимально саркастичный, но в целом доброжелательный бот-друг Максима. "
-            "Твоя задача — сделать короткий вечерний обзор дня в чате. "
-            "Пиши по-русски, на 'ты'. 2–4 предложения. "
-            "Отмечай, о чём Максим писал, много ли размышлял, ныл или шутил, "
-            "как его поддерживали, что он игнорировал и т.п. "
-            "Сарказм должен быть очевидным, но без оскорблений и грубостей."
+            "Ты саркастичный, но не злонамеренный бот-друг Максима. "
+            "Ты подводишь итоги дня по переписке в чате. "
+            "Пиши по-русски, на 'ты'. 3–6 предложений. "
+            "Можешь иронизировать, подколоть участников, особенно Максима, "
+            "но избегай оскорблений и жесткой токсичности."
         )
+        messages_text = "\n".join(day_messages or [])
+        # Немного ограничим размер
+        if len(messages_text) > 3000:
+            messages_text = messages_text[-3000:]
 
-        if not day_log_text:
-            user_prompt = (
-                f"Сегодня {weekday_name}, время {time_str}. "
-                "За день сообщений почти не было. "
-                "Сделай саркастичный комментарий, что день прошёл тихо и бот почти скучал."
-            )
-        else:
-            user_prompt = (
-                f"Сегодня {weekday_name}, время {time_str}. "
-                "Вот хронология сообщений за день в формате 'HH:MM [имя] текст':\n\n"
-                f"{day_log_text}\n\n"
-                "Сделай короткий саркастичный обзор дня для Максима."
-            )
-
-        return await call_openai(system_prompt, user_prompt, max_tokens=150, temperature=0.8)
+        user_prompt = (
+            f"Сегодня {weekday_name}, дата {date_str}. Вот сообщения за день в чате:\n"
+            f"{messages_text}\n\n"
+            "Сделай краткий, саркастичный обзор дня в чате для Максима. "
+            "Подчеркни самые забавные или типичные моменты."
+        )
+        return await call_openai(system_prompt, user_prompt, max_tokens=200, temperature=0.9)
 
     return None, "Unknown message kind"
-
-
-def build_day_log_text(for_date: date) -> str | None:
-    """Собираем текст логов за указанный день для промпта."""
-    lines: list[str] = []
-    for msg in DAILY_MESSAGES:
-        if msg["dt"].date() != for_date:
-            continue
-        # только сообщения из нужного чата
-        if GROUP_CHAT_ID and int(GROUP_CHAT_ID) != msg["chat_id"]:
-            continue
-        ts = msg["dt"].strftime("%H:%M")
-        name = msg["from_name"]
-        text = msg["text"].replace("\n", " ")
-        lines.append(f"{ts} [{name}] {text}")
-
-    if not lines:
-        return None
-
-    # ограничим длину, чтобы не взорвать токены
-    joined = "\n".join(lines)
-    if len(joined) > 3000:
-        joined = joined[-3000:]
-    return joined
 
 
 # ---------- COMMAND HANDLERS ----------
@@ -275,17 +267,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Привет! Я Друг Максима 🤖\n"
             "В группе я буду:\n"
-            "• По будням в 7:00 (по Брисбену) желать Максиму доброго утра с комментарием про погоду.\n"
-            "• По выходным — примерно раз в час писать ему в случайную минуту.\n"
-            "• В 20:30 каждый день — делать саркастичный обзор его дня.\n"
+            "• По будням в 7:00 желать Максиму доброго утра и хорошего рабочего дня (с погодой).\n"
+            "• По выходным писать ему примерно раз в час в случайное время.\n"
+            "• В 20:30 делать саркастический обзор дня.\n"
             "Ночью с 22:00 до 7:00 я молчу 😴"
         )
     else:
         await update.message.reply_text(
-            "Я здесь, чтобы слегка издеваться над Максимом и параллельно его поддерживать.\n"
-            "• Будни: утреннее сообщение в 7:00 с погодой.\n"
+            "Я здесь, чтобы поддерживать Максима и слегка его подкалывать:\n"
+            "• Будни: сообщение в 7:00 с погодой.\n"
             "• Выходные: раз в час в случайную минуту.\n"
-            "• Каждый день в 20:30: саркастичный обзор дня.\n"
+            "• Каждый день в 20:30 — обзор дня.\n"
             "Ночью с 22:00 до 7:00 я не беспокою."
         )
 
@@ -333,23 +325,19 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         f"user_id={user_id} user_name={user.username} text='{text}'"
     )
 
-    # Сохраняем сообщение для дневного анализа
-    tz = get_tz()
-    DAILY_MESSAGES.append(
-        {
-            "dt": datetime.now(tz),
-            "chat_id": chat_id,
-            "from_id": user_id,
-            "from_name": user.full_name or (user.username or "unknown"),
-            "text": text,
-        }
-    )
-
     # Если это не целевой групповой чат, ничего не делаем
     if GROUP_CHAT_ID and int(GROUP_CHAT_ID) != chat_id:
         return
 
+    # Логируем сообщение для вечернего обзора
+    tz = get_tz()
     now = datetime.now(tz)
+    date_key = now.strftime("%Y-%m-%d")
+    author = user.first_name or user.username or str(user_id)
+    DAILY_MESSAGES[date_key].append(f"{author}: {text}")
+    # ограничим размер списка, чтобы не раздувался бесконечно
+    if len(DAILY_MESSAGES[date_key]) > 200:
+        DAILY_MESSAGES[date_key] = DAILY_MESSAGES[date_key][-200:]
 
     # Сообщения Максима — саркастичный ответ
     if TARGET_USER_ID and user_id == TARGET_USER_ID:
@@ -383,25 +371,26 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     return
 
 
-# ---------- UNIVERSAL SCHEDULER JOB ----------
+# ---------- SCHEDULED JOBS ----------
 
-async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
+async def weekend_random_hourly_job(context: ContextTypes.DEFAULT_TYPE):
     """
-    Запускается каждую минуту и внутри решает:
-    - будний ли день / выходной;
-    - нужно ли отправить утреннее сообщение;
-    - нужно ли отправить выходное часовое сообщение;
-    - нужно ли отправить вечерний обзор.
+    Запускается каждую минуту.
+    По выходным раз в час выбирает случайную минуту и в неё шлёт сообщение Максиму.
     """
     if not GROUP_CHAT_ID:
         return
 
     tz = get_tz()
     now = datetime.now(tz)
-    weekday = now.weekday()  # 0=Mon..6=Sun
 
+    weekday = now.weekday()  # 0=Mon ... 6=Sun
+    if weekday < 5:
+        # Будни — этим джобом не занимаемся
+        return
+
+    # Ночной режим
     if is_night_time(now):
-        # Ночью ничего не делаем
         return
 
     job = context.job
@@ -409,92 +398,114 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
         job.data = {}
 
     data = job.data
+    current_hour = now.hour
+    last_hour = data.get("last_hour")
+    target_minute = data.get("target_minute")
+    sent_this_hour = data.get("sent_this_hour", False)
 
-    # ------ Утреннее сообщение по будням (7:00) ------
-    if weekday < 5 and now.hour == 7 and now.minute == 0:
-        last_morning_date = data.get("last_morning_date")
-        if last_morning_date != now.date().isoformat():
-            weather_brief = await get_weather_brief(now)
-            text, err = await generate_message_for_kind(
-                "weekday_morning", now=now, weather_brief=weather_brief
+    # Новый час — планируем новую случайную минуту и сбрасываем флаг
+    if last_hour is None or current_hour != last_hour:
+        target_minute = random.randint(0, 59)
+        sent_this_hour = False
+        data["last_hour"] = current_hour
+        data["target_minute"] = target_minute
+        data["sent_this_hour"] = sent_this_hour
+        print(f"[Weekend scheduler] New hour {current_hour}, planned minute {target_minute}")
+
+    # Если ещё не отправляли в этом часе и наступила нужная минута — шлём
+    if not sent_this_hour and now.minute == target_minute:
+        text, err = await generate_message_for_kind(
+            "weekend_hourly", now=now
+        )
+        if text is None:
+            text = "Максим, как у тебя дела? Чем сейчас занимаешься?"
+            print(f"OpenAI error for weekend_hourly: {err}")
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(GROUP_CHAT_ID),
+                text=text,
             )
-            if text is None:
-                text = (
-                    "Доброе утро, Максим! Погода какая-то, работа никуда не денется, "
-                    "так что давай уже просыпаться. 😉"
-                )
-                print(f"OpenAI error for weekday_morning: {err}")
-
-            try:
-                await context.bot.send_message(
-                    chat_id=int(GROUP_CHAT_ID),
-                    text=text,
-                )
-                data["last_morning_date"] = now.date().isoformat()
-                print(f"[Scheduler] Sent weekday morning message at {now}")
-            except Exception as e:
-                print("Error sending weekday morning message:", e)
-
-    # ------ Выходные: раз в час в случайную минуту ------
-    if weekday >= 5:
-        current_hour = now.hour
-        last_hour = data.get("weekend_last_hour")
-        target_minute = data.get("weekend_target_minute")
-        sent_this_hour = data.get("weekend_sent_this_hour", False)
-
-        # Новый час — выбираем случайную минуту
-        if last_hour is None or current_hour != last_hour:
-            target_minute = random.randint(0, 59)
-            sent_this_hour = False
-            data["weekend_last_hour"] = current_hour
-            data["weekend_target_minute"] = target_minute
-            data["weekend_sent_this_hour"] = sent_this_hour
-            print(f"[Scheduler] Weekend: new hour {current_hour}, target minute {target_minute}")
-
-        if not sent_this_hour and now.minute == target_minute:
-            text, err = await generate_message_for_kind(
-                "weekend_hourly", now=now
-            )
-            if text is None:
-                text = "Максим, как у тебя дела? Чем сейчас занимаешься?"
-                print(f"OpenAI error for weekend_hourly: {err}")
-
-            try:
-                await context.bot.send_message(
-                    chat_id=int(GROUP_CHAT_ID),
-                    text=text,
-                )
-                data["weekend_sent_this_hour"] = True
-                print(f"[Scheduler] Sent weekend hourly message at {now}")
-            except Exception as e:
-                print("Error sending weekend hourly message:", e)
-
-    # ------ Вечерний обзор дня: каждый день в 20:30 ------
-    if now.hour == 20 and now.minute == 30:
-        last_summary_date = data.get("last_summary_date")
-        if last_summary_date != now.date().isoformat():
-            day_log_text = build_day_log_text(for_date=now.date())
-            text, err = await generate_message_for_kind(
-                "day_summary", now=now, day_log_text=day_log_text
-            )
-            if text is None:
-                text = (
-                    "День прошёл так тихо, что даже мне нечего сказать. "
-                    "Максим, ты сегодня точно был в онлайне?"
-                )
-                print(f"OpenAI error for day_summary: {err}")
-
-            try:
-                await context.bot.send_message(
-                    chat_id=int(GROUP_CHAT_ID),
-                    text=text,
-                )
-                data["last_summary_date"] = now.date().isoformat()
-                print(f"[Scheduler] Sent day summary at {now}")
-            except Exception as e:
-                print("Error sending day summary message:", e)
+            data["sent_this_hour"] = True
+            print(f"[Weekend scheduler] Sent hourly message at {now}")
+        except Exception as e:
+            print("Error sending weekend hourly message:", e)
 
     job.data = data
+
+
+async def weekday_morning_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Запускается в 7:00 по будням.
+    """
+    if not GROUP_CHAT_ID:
+        return
+
+    tz = get_tz()
+    now = datetime.now(tz)
+
+    weekday = now.weekday()
+    if weekday >= 5:
+        # На всякий случай: по выходным это сообщение не нужно
+        return
+
+    weather_text = await fetch_weather_summary()
+
+    text, err = await generate_message_for_kind(
+        "weekday_morning", now=now, weather_text=weather_text
+    )
+    if text is None:
+        base = "Доброе утро, Максим! Удачи сегодня на работе — я слежу за тобой из чата. 😉"
+        if weather_text:
+            text = f"{base}\n\nКстати, {weather_text}"
+        else:
+            text = base
+        print(f"OpenAI error for weekday_morning: {err}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(GROUP_CHAT_ID),
+            text=text,
+        )
+        print(f"[Weekday morning] Sent morning message at {now}")
+    except Exception as e:
+        print("Error sending weekday morning message:", e)
+
+
+async def daily_summary_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Вечерний саркастический обзор в 20:30 каждый день.
+    """
+    if not GROUP_CHAT_ID:
+        return
+
+    tz = get_tz()
+    now = datetime.now(tz)
+    date_key = now.strftime("%Y-%m-%d")
+    messages = DAILY_MESSAGES.get(date_key, [])
+
+    if not messages:
+        text = "Сегодня в чате тишина. Видимо, жизнь у всех настолько насыщенная, что даже пожаловаться некогда."
+    else:
+        text, err = await generate_message_for_kind(
+            "daily_summary", now=now, day_messages=messages
+        )
+        if text is None:
+            text = "Итоги дня: что-то вы тут писали, но у меня нет сил всё это анализировать. Считай, что день прошёл… как обычно."
+            print(f"OpenAI error for daily_summary: {err}")
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(GROUP_CHAT_ID),
+            text=text,
+        )
+        print(f"[Daily summary] Sent summary at {now} with {len(messages)} messages.")
+    except Exception as e:
+        print("Error sending daily summary:", e)
+
+    # Чистим за прошедший день
+    if date_key in DAILY_MESSAGES:
+        del DAILY_MESSAGES[date_key]
 
 
 # ---------- MAIN APP ----------
@@ -502,6 +513,8 @@ async def scheduler_tick(context: ContextTypes.DEFAULT_TYPE):
 def main():
     if not TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in environment variables!")
+
+    print("Starting bot application...")
 
     app = Application.builder().token(TOKEN).build()
 
@@ -526,23 +539,42 @@ def main():
         )
     )
 
-    # Универсальный шедулер раз в минуту
+    # JobQueue scheduling
     job_queue = app.job_queue
-    job_queue.run_repeating(
-        scheduler_tick,
-        interval=60,    # каждую минуту
-        first=0,        # сразу
-        name="scheduler_tick",
-        data={},        # состояние
-    )
-
     tz = get_tz()
     now = datetime.now(tz)
+
     print(
         f"Local time now: {now} [{TIMEZONE}]. "
-        "Universal scheduler job started (every 60s)."
+        "Scheduling weekday morning, weekend hourly and daily summary jobs."
     )
 
+    # Будние утренние сообщения в 7:00 (пн–пт)
+    job_queue.run_daily(
+        weekday_morning_job,
+        time=time(7, 0, tzinfo=tz),
+        days=(0, 1, 2, 3, 4),
+        name="weekday_morning_job",
+    )
+
+    # Выходные: джоба раз в минуту, внутри — логика случайной минуты
+    job_queue.run_repeating(
+        weekend_random_hourly_job,
+        interval=60,          # каждую минуту
+        first=0,              # сразу
+        name="weekend_random_hourly_job",
+        data={},              # для хранения состояния по часам
+    )
+
+    # Вечерний обзор в 20:30 каждый день
+    job_queue.run_daily(
+        daily_summary_job,
+        time=time(20, 30, tzinfo=tz),
+        days=(0, 1, 2, 3, 4, 5, 6),
+        name="daily_summary_job",
+    )
+
+    print("Bot started and jobs scheduled...")
     app.run_polling()
 
 

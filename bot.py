@@ -573,7 +573,7 @@ def main():
     # Пожелание спокойной ночи в 21:00 каждый день
     job_queue.run_daily(
         good_night_job,
-        time=time(21, 50, tzinfo=tz),
+        time=time(21, 00, tzinfo=tz),
         name="good_night_job",
     )
 

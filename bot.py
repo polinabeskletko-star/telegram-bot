@@ -371,7 +371,7 @@ async def generate_message_for_kind(
         return await call_openai(
             system_prompt,
             user_prompt,
-            max_tokens=220,
+            max_tokens=500,
             temperature=0.8,
             history=history,
         )

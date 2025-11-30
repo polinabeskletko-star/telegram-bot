@@ -32,7 +32,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID")
 
 # OpenAI
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini-browsing")
 
 client: Optional[OpenAI] = None
 if OPENAI_API_KEY:

@@ -274,7 +274,7 @@ async def generate_samuil_answer(
 
     extra_context_parts = [
         f"Сегодня {weekday_name}, время {time_str}.",
-        "Ты находишься в групповом чате и отвечаешь только когда к тебе обращаются по имени «Самуил»."
+        "Ты находишься в групповом чате и отвечаешь только когда к тебе обращаются по имени «Самуил».",
     ]
     if weather_info is not None:
         weather_str = format_weather_for_prompt(weather_info)
@@ -443,6 +443,7 @@ async def handle_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
     """
     В 20:30 делает саркастический обзор дня по сообщениям из daily_summary_log.
+    Сейчас НЕ используется в расписании, но оставлен на будущее.
     """
     if not GROUP_CHAT_ID:
         return
@@ -455,7 +456,6 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
     if not messages_today:
         return
 
-    # Собираем краткий конспект для ИИ
     joined = "\n".join(messages_today[-50:])  # ограничим последними 50 сообщениями
 
     system_prompt = build_samuil_system_prompt(include_maxim_context=True)
@@ -524,6 +524,44 @@ async def good_night_job(context: ContextTypes.DEFAULT_TYPE):
         print("Error sending good night message:", e)
 
 
+async def good_morning_job(context: ContextTypes.DEFAULT_TYPE):
+    """
+    В 07:30 желает Максиму доброго утра и хорошего дня
+    в фирменном слегка ехидном тоне.
+    """
+    if not GROUP_CHAT_ID:
+        return
+
+    tz = get_tz()
+    now = datetime.now(tz)
+
+    system_prompt = build_samuil_system_prompt(include_maxim_context=True)
+    user_prompt = (
+        "Сделай короткое (1–3 предложения) пожелание доброго утра и хорошего дня Максиму "
+        "от имени Самуила. Можно мягко подколоть его утреннюю продуктивность, "
+        "привычку залипать в телефон, планы найти юную девушку или его уверенность "
+        "в собственной гениальности. Но в целом тон должен быть тёплым и мотивирующим."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    text, err = await call_openai_chat(messages, max_tokens=120, temperature=0.8)
+    if text is None:
+        print(f"OpenAI error for good morning: {err}")
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(GROUP_CHAT_ID),
+            text=text,
+        )
+        print(f"[Good morning] Sent at {now}")
+    except Exception as e:
+        print("Error sending good morning message:", e)
+
+
 # ---------- MAIN APP ----------
 
 def main():
@@ -560,22 +598,38 @@ def main():
 
     print(
         f"Local time now: {now} [{TIMEZONE}]. "
-        "Scheduling evening summary and good night jobs."
+        "Scheduling daily jobs."
     )
 
-    # Вечерний саркастический обзор в 20:30 каждый день
+    # --- FIX ОТ ДУБЛИКАТОВ: убираем существующие задачи с теми же именами ---
+    for name in ["evening_summary_job", "good_night_job", "good_morning_job"]:
+        jobs = job_queue.get_jobs_by_name(name)
+        if jobs:
+            print(f"Removing existing jobs for name={name}: {len(jobs)} шт.")
+        for job in jobs:
+            job.schedule_removal()
+    # ----------------------------------------------------------------------- #
+
+    # Утреннее сообщение в 07:30
     job_queue.run_daily(
-        evening_summary_job,
-        time=time(20, 30, tzinfo=tz),
-        name="evening_summary_job",
+        good_morning_job,
+        time=time(7, 30, tzinfo=tz),
+        name="good_morning_job",
     )
 
-    # Пожелание спокойной ночи в 21:00 каждый день
+    # Вечернее сообщение (спокойной ночи) в 21:00
     job_queue.run_daily(
         good_night_job,
-        time=time(21, 00, tzinfo=tz),
+        time=time(21, 0, tzinfo=tz),
         name="good_night_job",
     )
+
+    # Если захочешь вернуть вечерний обзор дня в 20:30 — просто раскомментируй:
+    # job_queue.run_daily(
+    #     evening_summary_job,
+    #     time=time(20, 30, tzinfo=tz),
+    #     name="evening_summary_job",
+    # )
 
     print("Bot started and jobs scheduled...")
     app.run_polling()

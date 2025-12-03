@@ -88,19 +88,25 @@ SYSTEM_PROMPT_SAMUIL = f"""
 
 # ==== ПАМЯТЬ КОНТЕКСТА ====
 
-# Храним последние N сообщений на пользователя/чат
 MAX_HISTORY = 15
 dialog_history: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+
 
 def add_to_history(key: str, role: str, content: str) -> None:
     history = dialog_history[key]
     history.append({"role": role, "content": content})
     if len(history) > MAX_HISTORY:
-        # Обрезаем старые сообщения
         dialog_history[key] = history[-MAX_HISTORY:]
 
 
-# ==== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====
+# ==== АНТИ-ДУБЛИКАТ ДЛЯ ПЛАНОВЫХ СООБЩЕНИЙ ====
+
+# Храним, в какой день уже отправляли утреннее/вечернее сообщение
+last_scheduled_run: Dict[str, date] = {
+    "morning": None,
+    "evening": None,
+}
+
 
 def get_tz() -> pytz.timezone:
     return pytz.timezone(TIMEZONE)
@@ -118,7 +124,6 @@ async def fetch_weather() -> Optional[str]:
         "lang": "ru",
     }
 
-    # Можно использовать либо city ID, либо q=City,Country
     if OPENWEATHER_CITY_ID:
         params["id"] = OPENWEATHER_CITY_ID
     else:
@@ -145,11 +150,9 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
     """Обращение к OpenAI с учётом системного промта и истории диалога."""
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_SAMUIL}]
 
-    # История
     for h in dialog_history[history_key]:
         messages.append(h)
 
-    # Текущее сообщение пользователя
     user_prefix = "Сообщение от Максима: " if from_maxim else "Сообщение от другого участника: "
     messages.append({"role": "user", "content": user_prefix + prompt})
 
@@ -161,10 +164,9 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
             max_tokens=300,
         )
         answer = resp.choices[0].message.content.strip()
-    except Exception as e:
+    except Exception:
         answer = "Я тут чуть задумался и временно не могу ответить как обычно. Попробуй ещё раз чуть позже."
 
-    # Сохраняем в историю
     add_to_history(history_key, "user", user_prefix + prompt)
     add_to_history(history_key, "assistant", answer)
     return answer
@@ -172,6 +174,28 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
 
 def is_maxim(user_id: Optional[int]) -> bool:
     return user_id is not None and TARGET_USER_ID != 0 and user_id == TARGET_USER_ID
+
+
+def is_addressed_to_bot(text: str, bot_username: Optional[str]) -> bool:
+    """
+    Проверяем, обращаются ли к боту:
+    - упоминание 'самуил'
+    - @username бота
+    """
+    if not text:
+        return False
+
+    t = text.lower()
+
+    if "самуил" in t:
+        return True
+
+    if bot_username:
+        uname = bot_username.lower()
+        if f"@{uname}" in t:
+            return True
+
+    return False
 
 
 # ==== ХЕНДЛЕРЫ ТЕЛЕГРАМА ====
@@ -189,8 +213,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     text = msg.text or ""
-    from_max = is_maxim(user.id)
     history_key = f"{chat.id}"
+    from_max = is_maxim(user.id)
+
+    chat_type = chat.type
+
+    # Узнаём username бота
+    bot = await context.bot.get_me()
+    bot_username = bot.username if bot.username else None
+
+    # Логика:
+    # - В группе/супергруппе:
+    #     * Максим -> всегда отвечаем
+    #     * не Максим -> только при обращении (Самуил или @username)
+    # - В личке -> отвечаем всегда
+    if chat_type in ("group", "supergroup"):
+        if not from_max:
+            if not is_addressed_to_bot(text, bot_username):
+                return
 
     reply = await ask_openai(text, history_key, from_max)
     await msg.reply_text(reply)
@@ -200,14 +240,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def send_morning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Одно утреннее сообщение Максиму (или в чат, где он есть)."""
+    global last_scheduled_run
     tz = get_tz()
     today = datetime.now(tz).date()
-    # Небольшой промт в OpenAI, чтобы каждый раз фраза отличалась
+
+    # Защита от дублей: если уже отправляли сегодня — выходим
+    if last_scheduled_run.get("morning") == today:
+        return
+    last_scheduled_run["morning"] = today
+
     weather_text = await fetch_weather()
     base_prompt = "Сгенерируй короткое доброе утреннее сообщение для Максима в тёплом, слегка саркастичном стиле."
     if weather_text:
         base_prompt += f" Добавь комментарий к погоде: {weather_text}"
 
+    # Историю для плановых сообщений можно вести отдельно, чтобы не засорять чат
     answer = await ask_openai(base_prompt, history_key=f"system-morning-{today}", from_maxim=True)
 
     target_chat_id = GROUP_CHAT_ID or TARGET_USER_ID
@@ -217,8 +264,15 @@ async def send_morning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def send_evening_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Одно вечернее сообщение Максиму (спокойной ночи, но с характером)."""
+    global last_scheduled_run
     tz = get_tz()
     today = datetime.now(tz).date()
+
+    # Защита от дублей: если уже отправляли сегодня — выходим
+    if last_scheduled_run.get("evening") == today:
+        return
+    last_scheduled_run["evening"] = today
+
     base_prompt = (
         "Сгенерируй короткое вечернее сообщение Максиму с пожеланием спокойной ночи "
         "в тёплом, слегка игривом и слегка саркастичном стиле."
@@ -239,24 +293,20 @@ def main() -> None:
 
     application = Application.builder().token(TOKEN).build()
 
-    # Команда /start
     application.add_handler(CommandHandler("start", start))
-
-    # Основной обработчик сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Планировщик
     tz = get_tz()
     jq = application.job_queue
 
-    # Утреннее сообщение, например, в 7:30
+    # Утреннее сообщение в 7:30
     jq.run_daily(
         send_morning_message,
         time=time(hour=7, minute=30, tzinfo=tz),
         name="morning_message",
     )
 
-    # Вечернее сообщение, например, в 21:00
+    # Вечернее сообщение в 21:00
     jq.run_daily(
         send_evening_message,
         time=time(hour=21, minute=0, tzinfo=tz),

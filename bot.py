@@ -51,8 +51,8 @@ MAXIM_PROFILE = """
 
 Ключевые принципы общения с Максимом:
 - обращаться по имени «Максим»;
-- тон: тёплый, живой, чуть игривый, с мягким сарказмом и самоиронией;
-- избегать морализаторства, давления, критики и «злых» шуток;
+- тон: тёплый, живой, чуть игривый, с мягким, но заметным сарказмом;
+- избегать морализаторства, давления, прямой критики и злых шуток;
 - регулярно показывать внимание и чувство, что о нём помнят;
 - поддерживать, подбадривать, помогать чувствовать себя нужным и интересным.
 """
@@ -63,53 +63,64 @@ SYSTEM_PROMPT_SAMUIL = f"""
 {MAXIM_PROFILE}
 
 ТВОЯ РОЛЬ:
-- быть для Максима умным, ироничным, но добрым собеседником;
+- быть для Максима умным, ироничным, иногда ехидным, но в итоге доброжелательным собеседником;
 - поддерживать его, подкидывать мысли, комментировать погоду и события дня;
 - отвечать живо, без шаблонов, на русском языке.
 
 СТИЛЬ ОТВЕТОВ:
 - используй короткие или средние по длине сообщения;
 - говори естественно, как живой человек;
-- добавляй мягкий сарказм, но не переходи в грубость;
+- добавляй явный, но добрый сарказм и лёгкую ехидность;
+- можешь слегка подшучивать над драматичностью, ленивостью, прокрастинацией и т.п.;
+- не переходи на оскорбления, внешность, унижение или жёсткую психологическую критику;
 - не сюсюкай, не используй детский стиль;
 - не впадай в пафос и «глубокую философию» без необходимости.
 
 ЕСЛИ СООБЩЕНИЕ ПИШЕТ МАКСИМ:
 - обращайся к нему по имени;
-- можешь слегка флиртовать и поддразнивать, но с уважением;
-- показывай, что тебе приятно его читать и что ты его ценишь.
+- можешь флиртовать и поддразнивать, но с уважением и теплом;
+- показывай, что тебе приятно его читать и что ты его ценишь;
+- иногда чуть «подкалывай» его привычки, драму, лень или хаос — но мягко.
 
 ЕСЛИ СООБЩЕНИЕ ПИШЕТ НЕ МАКСИМ:
-- отвечай нейтральнее, без флирта и персональных комплиментов;
-- но сохраняй вежливость и лёгкий юмор.
+- отвечай нейтральнее, но всё равно с лёгким юмором и лёгким сарказмом;
+- не выдавай им такой же уровень персонального тепла и флирта, как Максиму.
 
-Если тебя просят что-то объяснить, помоги понятно и по делу.
+Если тебя просят что-то объяснить, объясняй понятно, по делу и можно с ироничным комментарием.
 """
 
 # ==== ПАМЯТЬ КОНТЕКСТА ====
 
-MAX_HISTORY = 15
-dialog_history: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+# Увеличим историю, чтобы было что анализировать вечером
+MAX_HISTORY = 50
+dialog_history: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+
+
+def get_tz() -> pytz.timezone:
+    return pytz.timezone(TIMEZONE)
 
 
 def add_to_history(key: str, role: str, content: str) -> None:
+    """Сохраняем роль, текст и таймстамп (для анализа 'за день')."""
+    tz = get_tz()
     history = dialog_history[key]
-    history.append({"role": role, "content": content})
+    history.append(
+        {
+            "role": role,
+            "content": content,
+            "ts": datetime.now(tz).isoformat(),
+        }
+    )
     if len(history) > MAX_HISTORY:
         dialog_history[key] = history[-MAX_HISTORY:]
 
 
 # ==== АНТИ-ДУБЛИКАТ ДЛЯ ПЛАНОВЫХ СООБЩЕНИЙ ====
 
-# Храним, в какой день уже отправляли утреннее/вечернее сообщение
-last_scheduled_run: Dict[str, date] = {
+last_scheduled_run: Dict[str, Optional[date]] = {
     "morning": None,
     "evening": None,
 }
-
-
-def get_tz() -> pytz.timezone:
-    return pytz.timezone(TIMEZONE)
 
 
 async def fetch_weather() -> Optional[str]:
@@ -150,8 +161,9 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
     """Обращение к OpenAI с учётом системного промта и истории диалога."""
     messages: List[Dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT_SAMUIL}]
 
+    # История: берём только role+content, ts нам не нужен в API
     for h in dialog_history[history_key]:
-        messages.append(h)
+        messages.append({"role": h["role"], "content": h["content"]})
 
     user_prefix = "Сообщение от Максима: " if from_maxim else "Сообщение от другого участника: "
     messages.append({"role": "user", "content": user_prefix + prompt})
@@ -160,12 +172,12 @@ async def ask_openai(prompt: str, history_key: str, from_maxim: bool) -> str:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
-            temperature=0.8,
+            temperature=0.9,  # чуть больше рандома и дерзости
             max_tokens=300,
         )
         answer = resp.choices[0].message.content.strip()
     except Exception:
-        answer = "Я тут чуть задумался и временно не могу ответить как обычно. Попробуй ещё раз чуть позже."
+        answer = "Я тут чуть завис в своих глубокомысленных мыслях. Попробуй ещё раз чуть позже."
 
     add_to_history(history_key, "user", user_prefix + prompt)
     add_to_history(history_key, "assistant", answer)
@@ -198,6 +210,93 @@ def is_addressed_to_bot(text: str, bot_username: Optional[str]) -> bool:
     return False
 
 
+def is_reply_to_bot(update: Update, bot_id: int) -> bool:
+    """
+    Проверяем, является ли сообщение ответом (Reply) на сообщение бота.
+    Если да — считаем, что это продолжение диалога и отвечаем даже без упоминания.
+    """
+    msg = update.effective_message
+    if not msg or not msg.reply_to_message:
+        return False
+
+    original = msg.reply_to_message
+    if original.from_user and original.from_user.id == bot_id:
+        return True
+
+    return False
+
+
+def get_today_conversation_excerpt(tz: pytz.timezone) -> Optional[str]:
+    """
+    Собираем короткий фрагмент диалога за сегодня,
+    чтобы вечером сделать по нему мини-анализ.
+    Берём историю из основного чата (GROUP_CHAT_ID) или лички с Максимом.
+    """
+    # Ключ истории такой же, как в handle_message: f"{chat.id}"
+    main_key = None
+    if GROUP_CHAT_ID:
+        main_key = GROUP_CHAT_ID
+    elif TARGET_USER_ID:
+        main_key = str(TARGET_USER_ID)
+
+    if not main_key:
+        return None
+
+    history = dialog_history.get(main_key, [])
+    if not history:
+        return None
+
+    today = datetime.now(tz).date()
+    lines: List[str] = []
+
+    for h in history:
+        ts_str = h.get("ts")
+        # Если таймстампа нет — считаем, что можно включать (на случай старых записей)
+        include = True
+        if ts_str:
+            try:
+                dt = datetime.fromisoformat(ts_str)
+                dt_local = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=tz)
+                if dt_local.date() != today:
+                    include = False
+            except Exception:
+                # если не смогли распарсить — просто включим
+                include = True
+
+        if not include:
+            continue
+
+        role = h.get("role")
+        content = h.get("content", "")
+
+        # Пропускаем системные штуки
+        if role == "system":
+            continue
+
+        # Слегка чистим содержимое (чтобы не было видно префиксов целиком)
+        if "Сообщение от Максима:" in content:
+            label = "Максим"
+            text = content.replace("Сообщение от Максима:", "").strip()
+        elif "Сообщение от другого участника:" in content:
+            label = "Другой участник"
+            text = content.replace("Сообщение от другого участника:", "").strip()
+        else:
+            label = "Бот" if role == "assistant" else "Кто-то"
+            text = content.strip()
+
+        if not text:
+            continue
+
+        lines.append(f"{label}: {text}")
+
+    if not lines:
+        return None
+
+    # Ограничим длину, чтобы не перегружать промт
+    excerpt = "\n".join(lines[-30:])  # последние ~30 реплик
+    return excerpt
+
+
 # ==== ХЕНДЛЕРЫ ТЕЛЕГРАМА ====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -215,23 +314,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = msg.text or ""
     history_key = f"{chat.id}"
     from_max = is_maxim(user.id)
-
     chat_type = chat.type
 
-    # Узнаём username бота
+    # Узнаём username и id бота
     bot = await context.bot.get_me()
     bot_username = bot.username if bot.username else None
+    bot_id = bot.id
 
-    # Логика:
-    # - В группе/супергруппе:
-    #     * Максим -> всегда отвечаем
-    #     * не Максим -> только при обращении (Самуил или @username)
-    # - В личке -> отвечаем всегда
+    # В группе/супергруппе:
+    # - Максим -> отвечаем всегда
+    # - не Максим:
+    #     * отвечаем, если есть обращение к боту (Самуил / @username),
+    #       ИЛИ если это reply на сообщение бота (продолжение ветки диалога)
     if chat_type in ("group", "supergroup"):
         if not from_max:
-            if not is_addressed_to_bot(text, bot_username):
-                return
+            addressed = is_addressed_to_bot(text, bot_username)
+            replied_to_bot = is_reply_to_bot(update, bot_id)
+            if not addressed and not replied_to_bot:
+                return  # игнорируем фон
 
+    # В личке — отвечаем всегда
     reply = await ask_openai(text, history_key, from_max)
     await msg.reply_text(reply)
 
@@ -244,17 +346,19 @@ async def send_morning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
     tz = get_tz()
     today = datetime.now(tz).date()
 
-    # Защита от дублей: если уже отправляли сегодня — выходим
     if last_scheduled_run.get("morning") == today:
         return
     last_scheduled_run["morning"] = today
 
     weather_text = await fetch_weather()
-    base_prompt = "Сгенерируй короткое доброе утреннее сообщение для Максима в тёплом, слегка саркастичном стиле."
+    base_prompt = (
+        "Сгенерируй короткое доброе утреннее сообщение для Максима в тёплом, "
+        "но саркастичном стиле: как будто ты добрый, но слегка ехидный друг, "
+        "который знает, что он опять не выспался или опять всё откладывал. "
+    )
     if weather_text:
         base_prompt += f" Добавь комментарий к погоде: {weather_text}"
 
-    # Историю для плановых сообщений можно вести отдельно, чтобы не засорять чат
     answer = await ask_openai(base_prompt, history_key=f"system-morning-{today}", from_maxim=True)
 
     target_chat_id = GROUP_CHAT_ID or TARGET_USER_ID
@@ -263,22 +367,41 @@ async def send_morning_message(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_evening_message(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Одно вечернее сообщение Максиму (спокойной ночи, но с характером)."""
+    """Одно вечернее сообщение Максиму: анализ дня + пожелание спокойной ночи."""
     global last_scheduled_run
     tz = get_tz()
     today = datetime.now(tz).date()
 
-    # Защита от дублей: если уже отправляли сегодня — выходим
     if last_scheduled_run.get("evening") == today:
         return
     last_scheduled_run["evening"] = today
 
-    base_prompt = (
-        "Сгенерируй короткое вечернее сообщение Максиму с пожеланием спокойной ночи "
-        "в тёплом, слегка игривом и слегка саркастичном стиле."
-    )
+    # Собираем фрагмент сегодняшней переписки
+    excerpt = get_today_conversation_excerpt(tz)
 
-    answer = await ask_openai(base_prompt, history_key=f"system-evening-{today}", from_maxim=True)
+    if excerpt:
+        base_prompt = (
+            "Вот краткая сводка сегодняшних сообщений в чате (Максим и другие участники):\n\n"
+            + excerpt
+            + "\n\n"
+              "Сначала сделай очень краткий (2–4 предложения) анализ дня: настроение Максима, "
+              "основные темы, общий вайб (с лёгким сарказмом, но по-доброму). "
+              "После этого добавь пожелание спокойной ночи Максиму в тёплом, игривом и саркастичном стиле. "
+              "Ответ должен быть одним сообщением, без списков и без обращения к этому системному описанию."
+        )
+    else:
+        base_prompt = (
+            "Сгенерируй короткое вечернее сообщение Максиму с пожеланием спокойной ночи "
+            "в тёплом, игривом и саркастичном стиле, как будто ты слегка подшучиваешь "
+            "над его днём и привычками, но явно на его стороне. "
+            "Сделай вид, что ты подводишь итоги дня, даже если данных у тебя мало."
+        )
+
+    answer = await ask_openai(
+        base_prompt,
+        history_key=f"system-evening-{today}",
+        from_maxim=True,
+    )
 
     target_chat_id = GROUP_CHAT_ID or TARGET_USER_ID
     if target_chat_id:
@@ -299,14 +422,12 @@ def main() -> None:
     tz = get_tz()
     jq = application.job_queue
 
-    # Утреннее сообщение в 7:30
     jq.run_daily(
         send_morning_message,
         time=time(hour=7, minute=30, tzinfo=tz),
         name="morning_message",
     )
 
-    # Вечернее сообщение в 21:00
     jq.run_daily(
         send_evening_message,
         time=time(hour=21, minute=0, tzinfo=tz),

@@ -50,6 +50,9 @@ dialog_history: Dict[Tuple[int, int], List[Dict[str, str]]] = defaultdict(list)
 # Логи сообщений для вечернего анализа: date_str -> list[str]
 daily_summary_log: Dict[str, List[str]] = defaultdict(list)
 
+# Флаг для отслеживания, были ли уже добавлены задачи
+_jobs_scheduled = False
+
 
 # ---------- HELPERS ----------
 
@@ -686,6 +689,48 @@ async def evening_summary_job(context: ContextTypes.DEFAULT_TYPE):
         print("Error sending evening summary message:", e)
 
 
+# ---------- JOB SCHEDULING MANAGEMENT ----------
+
+def setup_scheduled_jobs(application: Application):
+    """Настраивает запланированные задачи. Гарантирует, что они добавлены только один раз."""
+    global _jobs_scheduled
+    
+    if _jobs_scheduled:
+        print("Jobs already scheduled, skipping...")
+        return
+    
+    job_queue = application.job_queue
+    if not job_queue:
+        print("No job queue available!")
+        return
+    
+    # Очищаем все существующие задачи перед добавлением новых
+    print("Removing all existing jobs...")
+    for job in job_queue.jobs():
+        job.schedule_removal()
+    
+    tz = get_tz()
+    
+    # Утреннее сообщение в 07:30
+    job_queue.run_daily(
+        good_morning_job,
+        time=time(7, 30, tzinfo=tz),
+        name="good_morning_job",
+    )
+    
+    # Вечернее сообщение в 21:00
+    job_queue.run_daily(
+        evening_summary_job,
+        time=time(21, 0, tzinfo=tz),
+        name="evening_summary_job",
+    )
+    
+    _jobs_scheduled = True
+    print(f"Scheduled jobs at {datetime.now(tz)} [{TIMEZONE}]")
+    print(f"Good morning job: 07:30")
+    print(f"Evening summary job: 21:00")
+
+
 # ---------- MAIN APP ----------
 
 def main():
@@ -715,39 +760,10 @@ def main():
         )
     )
 
-    # JobQueue scheduling
-    job_queue = app.job_queue
-    tz = get_tz()
-    now = datetime.now(tz)
+    # Настраиваем задачи после создания приложения, но до запуска
+    app.post_init = setup_scheduled_jobs
 
-    print(
-        f"Local time now: {now} [{TIMEZONE}]. "
-        "Scheduling daily jobs."
-    )
-
-    # Удаляем старые задачи с теми же именами
-    for name in ["evening_summary_job", "good_morning_job"]:
-        jobs = job_queue.get_jobs_by_name(name)
-        if jobs:
-            print(f"Removing existing jobs for name={name}: {len(jobs)} шт.")
-        for job in jobs:
-            job.schedule_removal()
-
-    # Утреннее сообщение в 07:30
-    job_queue.run_daily(
-        good_morning_job,
-        time=time(7, 30, tzinfo=tz),
-        name="good_morning_job",
-    )
-
-    # Вечернее сообщение в 21:00
-    job_queue.run_daily(
-        evening_summary_job,
-        time=time(21, 0, tzinfo=tz),
-        name="evening_summary_job",
-    )
-
-    print("Bot started and jobs scheduled...")
+    print("Bot starting...")
     app.run_polling()
 
 
